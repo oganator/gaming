@@ -47,6 +47,17 @@ if ! dpkg -s sunshine &>/dev/null; then
   apt-get install -y /tmp/sunshine.deb && rm /tmp/sunshine.deb
 fi
 
+######  sunshine + desktop stuff above  ######
+
+echo "[+] installing Jupyter"
+python3 -m pip install --no-cache --upgrade \
+        notebook jupyterlab jupyterlab_server jupyter_server
+
+echo "[+] starting Jupyter (background)"
+nohup jupyter lab --ip=0.0.0.0 --port=8080 \
+      --NotebookApp.token="$JUPYTER_TOKEN" --no-browser \
+      > /var/log/jupyter.log 2>&1 &
+      
 ### 4 · dummy Xorg for real NVIDIA (harmless on Xvfb) ##########################
 if command -v nvidia-xconfig &>/dev/null && [ ! -f /etc/X11/xorg.conf ]; then
   nvidia-xconfig --allow-empty-initial-configuration --virtual="${RES%x24}"
