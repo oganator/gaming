@@ -10,6 +10,14 @@ log(){ printf '\e[1;36m%s\e[0m\n' "==> $*"; }
 # ---------- 0 · constants -----------------------------------
 RES="3840x2160x32"                       # virtual monitor (Xvfb)
 STEAM_AUTO="yes"                         # auto‑launch Steam? yes|no
+STEAM_USERNAME="${STEAM_USER:-}"
+STEAM_PASSWORD="${STEAM_PASS:-}"
+STEAM_GAMES=("2623190")          # <<-- Steam IDs (TF2, Dota 2, CSGO) 
+                                         # Find more here: https://steamdb.info/apps/
+if [[ -z "$STEAM_USERNAME" || -z "$STEAM_PASSWORD" ]]; then
+  log "ERROR: STEAM_USER / STEAM_PASS not set.  Pass them in --env."
+  exit 1
+fi
 
 # ---------- 1 · basic packages ------------------------------
 log "Updating apt & installing base packages"
@@ -38,21 +46,35 @@ if ! command -v steam &>/dev/null; then
   rm /tmp/steam.deb
 fi
 
-# Create auto-login for gamer
+# ---------- 4 · Auto-login & Game Download -------------------
+log "Configuring Steam auto-login and game downloads"
+
+# Create autostart script
 cat > /home/gamer/.xinitrc <<"EOF"
 #!/bin/bash
-steam -bigpicture
+steam -login __STEAM_USER__ __STEAM_PASS__ \
+  -silent -nobootstrapupdate -norepairfiles -noverifyfiles
 EOF
+
+# Replace credentials in autostart script
+sed -i "s/__STEAM_USER__/${STEAM_USERNAME}/" /home/gamer/.xinitrc
+sed -i "s/__STEAM_PASS__/${STEAM_PASSWORD}/" /home/gamer/.xinitrc
 
 chmod +x /home/gamer/.xinitrc
 chown gamer:gamer /home/gamer/.xinitrc
 
-# ---------- 4 · Jupyter stack -------------------------------
+# Pre-download specified games
+log "Downloading games: ${STEAM_GAMES[*]}"
+for GAME_ID in "${STEAM_GAMES[@]}"; do
+  sudo -u gamer steamcmd +login "${STEAM_USERNAME}" "${STEAM_PASSWORD}" +force_install_dir ~/SteamLibrary +app_update "${GAME_ID}" validate +quit
+done
+
+# ---------- 5 · Jupyter stack -------------------------------
 log "Installing JupyterLab"
 python3 -m pip install --no-cache --upgrade \
         jupyterlab notebook jupyterlab_server jupyter_server
 
-# ---------- 5 · one‑shot launcher script --------------------
+# ---------- 6 · one‑shot launcher script --------------------
 cat >/usr/local/bin/start-gaming <<"EOF"
 #!/usr/bin/env bash
 set -euo pipefail
@@ -83,7 +105,7 @@ chmod +x /usr/local/bin/start-gaming
 sed -i "s/__RES__/${RES}/"            /usr/local/bin/start-gaming
 sed -i "s/__STEAM_AUTO__/${STEAM_AUTO}/" /usr/local/bin/start-gaming
 
-# ---------- 6 · launch immediately --------------------------
+# ---------- 7 · launch immediately --------------------------
 log "Launching gaming stack"
 nohup /usr/local/bin/start-gaming >/var/log/start-gaming.log 2>&1 &
 
