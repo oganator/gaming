@@ -1,65 +1,128 @@
 #!/usr/bin/env bash
-# ─────────────────────────────────────────────────────────────
-# gaming.sh · headless Steam-Link host for Vast.ai
-# ─────────────────────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# oblivion_host.sh · one-shot bootstrap for a head-less Steam-Link host
+# • Ubuntu 22.04 base (vastai/linux-desktop:cuda-12.4-ubuntu-22.04)
+# • Installs Steam + SteamCMD
+# • Pre-downloads Elder Scrolls IV: Oblivion GOTY (AppID 22330)
+# • Starts GPU-backed dummy X server, PulseAudio, and Steam Big-Picture
+# ──────────────────────────────────────────────────────────────────────────────
 set -euo pipefail
 log(){ printf '\e[1;36m==> %s\n' "$*"; }
 
-RES="2560x1600x24"                # Xvfb virtual monitor
-STEAM_AUTO="yes"                  # always start Steam
-STEAM_USER="${STEAM_USER:-}"      # injected via template secret
-STEAM_PASS="${STEAM_PASS:-}"      # injected via template secret
+###############################################################################
+# 0 · USER SETTINGS – tweak as you like
+###############################################################################
+RES_W=3840 RES_H=2160            # encoded stream resolution
+STEAM_AUTO=yes                   # auto-start Steam Big-Picture
+STEAM_USER="${STEAM_USER:-}"     # set as template secret in Vast
+STEAM_PASS="${STEAM_PASS:-}"     # set as template secret in Vast
 
+# Oblivion GOTY - AppID 22330  (swap for your own titles)
+APPIDS=(2623190)
+
+###############################################################################
+# 1 · bare-minimum runtime deps
+###############################################################################
 export DEBIAN_FRONTEND=noninteractive
 dpkg --add-architecture i386
 apt-get update -qq
 apt-get install -yqq --no-install-recommends \
-  curl wget jq ca-certificates xvfb x11vnc pulseaudio dbus-user-session \
-  libgl1-mesa-dri:i386 libgl1:i386 libc6:i386 libstdc++6:i386 \
-  python3-pip
+        curl ca-certificates software-properties-common gnupg \
+        xserver-xorg-video-dummy xinit xrandr pulseaudio dbus-user-session \
+        libgl1:i386 libgl1-mesa-dri:i386 libc6:i386 libstdc++6:i386 \
+        steamcmd                                          # pulls ±25 MB
 
-# -------- user --------------------------------------------------------------
+###############################################################################
+# 2 · unprivileged gamer account
+###############################################################################
 if ! id gamer &>/dev/null; then
   log "Creating user 'gamer'"
   useradd -m -s /bin/bash gamer
   echo 'gamer ALL=(ALL) NOPASSWD:ALL' >/etc/sudoers.d/90-gamer
 fi
 
-# -------- Steam -------------------------------------------------------------
+###############################################################################
+# 3 · install full Steam client (needed for Big-Picture / NVENC streaming)
+###############################################################################
 if ! command -v steam &>/dev/null; then
-  log "Installing Steam"
+  log "Installing Steam client"
   curl -fsSL -o /tmp/steam.deb \
        https://cdn.cloudflare.steamstatic.com/client/installer/steam.deb
   apt-get install -y /tmp/steam.deb && rm /tmp/steam.deb
 fi
 
-# -------- Jupyter (optional admin shell) ------------------------------------
-python3 -m pip install --no-cache --upgrade \
-        jupyterlab notebook jupyterlab_server jupyter_server
+###############################################################################
+# 4 · head-less GPU-driven X server (dummy monitor)
+###############################################################################
+mkdir -p /etc/X11/xorg.conf.d
+cat >/etc/X11/xorg.conf.d/10-headless.conf <<EOF
+Section "Device"
+  Identifier  "GPU0"
+  Driver      "nvidia"
+  Option      "AllowEmptyInitialConfiguration" "True"
+EndSection
+Section "Screen"
+  Identifier "Screen0"
+  Device     "GPU0"
+  Monitor    "Monitor0"
+  DefaultDepth 24
+  SubSection "Display"
+    Depth     24
+    Modes     "${RES_W}x${RES_H}"
+  EndSubSection
+EndSection
+Section "Monitor"
+  Identifier "Monitor0"
+  Option     "Ignore" "false"
+EndSection
+EOF
 
-# -------- one-shot launcher --------------------------------------------------
-cat >/usr/local/bin/start-gaming <<"EOF"
+###############################################################################
+# 5 · pre-download game(s) with SteamCMD
+###############################################################################
+install_dir="/home/gamer/SteamLibrary"
+sudo -u gamer mkdir -p "$install_dir"
+
+if [[ -n "$STEAM_USER" && -n "$STEAM_PASS" ]]; then
+  log "Downloading games via SteamCMD (this can take a while)…"
+  for id in "${APPIDS[@]}"; do
+    sudo -u gamer steamcmd +@sSteamCmdForcePlatformType windows \
+          +login "$STEAM_USER" "$STEAM_PASS" \
+          +force_install_dir "$install_dir/$id" \
+          +app_update "$id" validate \
+          +quit
+  done
+else
+  log "⚠️  No Steam credentials provided → skipping auto-download"
+fi
+
+###############################################################################
+# 6 · one-shot runtime launcher
+###############################################################################
+cat >/usr/local/bin/start-steam-host <<"EOF"
 #!/usr/bin/env bash
 set -euo pipefail
 export DISPLAY=:0
 export HOME=/home/gamer
 
-# ① virtual X
-pgrep -f "Xvfb :0" || Xvfb :0 -screen 0 __RES__ &
+# Xorg head-less + GPU
+if ! pgrep -fx "X .*:0"; then
+  /usr/bin/X :0 -config /etc/X11/xorg.conf.d/10-headless.conf -nocursor \
+               &> /var/log/Xorg.0.log &
+fi
 
-# ② PulseAudio (system mode = fine in container)
+# PulseAudio (system mode is fine in container)
 pgrep -x pulseaudio || pulseaudio --system --disallow-exit --disable-shm &
 
-# ③ x11vnc (read-only view, no password)
-pgrep -f "x11vnc.*5900" || \
-  x11vnc -display :0 -ncache 10 -forever -shared -nopw -rfbport 5900 &
+# OPTIONAL VNC peek – uncomment for debugging then disable
+# pgrep -f "x11vnc.*5900" || \
+#   x11vnc -display :0 -forever -shared -nopw -rfbport 5900 &
 
-# ④ Steam in BP mode
-if [[ "__STEAM_AUTO__" == "yes" ]]; then
+# Steam Big-Picture auto-login
+if [[ "${STEAM_AUTO}" == "yes" ]]; then
   sudo -u gamer bash -c '
     if ! pgrep -x steam; then
       if [[ -n "$STEAM_USER" && -n "$STEAM_PASS" ]]; then
-        echo "auto-login credentials present"
         steam -silent -tenfoot -login "$STEAM_USER" "$STEAM_PASS" &
       else
         steam -silent -tenfoot &
@@ -67,26 +130,18 @@ if [[ "__STEAM_AUTO__" == "yes" ]]; then
     fi'
 fi
 
-# ⑤ Jupyter (admin only)
-pgrep -f "jupyter.*--port=8080" || \
-  nohup jupyter lab --ip=0.0.0.0 --port=8080 \
-        --no-browser --LabApp.token="$JUPYTER_TOKEN" \
-        >/var/log/jupyter.log 2>&1 &
-
 wait -n
 EOF
+chmod +x /usr/local/bin/start-steam-host
 
-# substitute vars
-sed -i "s/__RES__/${RES}/" /usr/local/bin/start-gaming
-sed -i "s/__STEAM_AUTO__/${STEAM_AUTO}/" /usr/local/bin/start-gaming
-chmod +x /usr/local/bin/start-gaming
+###############################################################################
+# 7 · launch and finish
+###############################################################################
+log "Starting Steam-Link host…"
+/usr/local/bin/start-steam-host >/var/log/steam-host.log 2>&1 &
 
-# -------- launch now --------------------------------------------------------
-log "Launching gaming stack"
-/usr/local/bin/start-gaming >/var/log/start-gaming.log 2>&1 &
-
-log "Steam-Link host ready:"
-log "  • Jupyter  : http://<IP>:8080 (token in /var/log/jupyter.log)"
-log "  • VNC peek : <VNC-client> → <IP>:5900"
-log "Ports 27036/TCP + 27037/UDP are already exposed for Steam Link."
+log "Setup complete."
+log "• Steam control port : 27036/tcp  (host side may be remapped)"
+log "• Steam data port    : 27037/udp  (host side may be remapped)"
+log "• Disk provisioned   : ensure --disk 130 when you create the instance"
 exit 0
