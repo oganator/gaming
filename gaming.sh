@@ -1,59 +1,47 @@
 #!/usr/bin/env bash
-# ──────────────────────────────────────────────────────────────────────────────
-# oblivion_host.sh · one-shot bootstrap for a head-less Steam-Link host
-# • Ubuntu 22.04 base (vastai/linux-desktop:cuda-12.4-ubuntu-22.04)
-# • Installs Steam + SteamCMD
-# • Pre-downloads Elder Scrolls IV: Oblivion GOTY (AppID 22330)
-# • Starts GPU-backed dummy X server, PulseAudio, and Steam Big-Picture
-# ──────────────────────────────────────────────────────────────────────────────
+###############################################################################
+#  oblivion_host.sh  ·  Head-less Steam-Link server for Vast.ai
+#  – Fixes apt multi-arch mess on vastai/linux-desktop:cuda-12.4-ubuntu-22.04
+#  – Pre-downloads Oblivion GOTY (AppID 22330) into /home/gamer/SteamLibrary
+#  – Starts GPU dummy X + PulseAudio + Steam Big-Picture
+#  – Needs: --disk 130  and ports 27036/tcp + 27037/udp open
+###############################################################################
 set -euo pipefail
 log(){ printf '\e[1;36m==> %s\n' "$*"; }
 
-###############################################################################
-# 0 · USER SETTINGS – tweak as you like
-###############################################################################
-RES_W=3840 RES_H=2160            # encoded stream resolution
-STEAM_AUTO=yes                   # auto-start Steam Big-Picture
-STEAM_USER="${STEAM_USER:-}"     # set as template secret in Vast
-STEAM_PASS="${STEAM_PASS:-}"     # set as template secret in Vast
+### 0 · user parameters #######################################################
+RES_W=3840 RES_H=2160                 # encoded stream resolution
+STEAM_USER="${STEAM_USER:-}"          # pass as Vast secret
+STEAM_PASS="${STEAM_PASS:-}"          # pass as Vast secret
+APPIDS=(2623190)                        # Oblivion GOTY
 
-# Oblivion GOTY - AppID 22330  (swap for your own titles)
-APPIDS=(2623190)
-
-###############################################################################
-# 1 · bare-minimum runtime deps
-###############################################################################
-export DEBIAN_FRONTEND=noninteractive
+### 1 · fix Vast’s “[arch=amd64] only” sources ###############################
+log "Enabling i386 packages in APT"
+sed -Ei 's/\[arch=amd64\]//g' /etc/apt/sources.list
 dpkg --add-architecture i386
 apt-get update -qq
+
+### 2 · base runtime deps #####################################################
+export DEBIAN_FRONTEND=noninteractive
 apt-get install -yqq --no-install-recommends \
         curl ca-certificates software-properties-common gnupg \
         xserver-xorg-video-dummy xinit xrandr pulseaudio dbus-user-session \
         libgl1:i386 libgl1-mesa-dri:i386 libc6:i386 libstdc++6:i386 \
-        steamcmd                                          # pulls ±25 MB
+        libssl3:i386 libudev1:i386 libgssapi-krb5-2:i386 steamcmd
 
-###############################################################################
-# 2 · unprivileged gamer account
-###############################################################################
-if ! id gamer &>/dev/null; then
-  log "Creating user 'gamer'"
-  useradd -m -s /bin/bash gamer
-  echo 'gamer ALL=(ALL) NOPASSWD:ALL' >/etc/sudoers.d/90-gamer
-fi
+### 3 · unprivileged user #####################################################
+useradd -m -s /bin/bash gamer 2>/dev/null || true
+echo 'gamer ALL=(ALL) NOPASSWD:ALL' >/etc/sudoers.d/90-gamer
 
-###############################################################################
-# 3 · install full Steam client (needed for Big-Picture / NVENC streaming)
-###############################################################################
+### 4 · Steam client ##########################################################
 if ! command -v steam &>/dev/null; then
-  log "Installing Steam client"
+  log "Installing full Steam client"
   curl -fsSL -o /tmp/steam.deb \
        https://cdn.cloudflare.steamstatic.com/client/installer/steam.deb
   apt-get install -y /tmp/steam.deb && rm /tmp/steam.deb
 fi
 
-###############################################################################
-# 4 · head-less GPU-driven X server (dummy monitor)
-###############################################################################
+### 5 · dummy-monitor Xorg ####################################################
 mkdir -p /etc/X11/xorg.conf.d
 cat >/etc/X11/xorg.conf.d/10-headless.conf <<EOF
 Section "Device"
@@ -61,87 +49,72 @@ Section "Device"
   Driver      "nvidia"
   Option      "AllowEmptyInitialConfiguration" "True"
 EndSection
+Section "Monitor"
+  Identifier "Monitor0"
+  Option     "Ignore" "false"
+EndSection
 Section "Screen"
   Identifier "Screen0"
   Device     "GPU0"
   Monitor    "Monitor0"
   DefaultDepth 24
   SubSection "Display"
-    Depth     24
-    Modes     "${RES_W}x${RES_H}"
+    Depth 24
+    Modes "${RES_W}x${RES_H}"
   EndSubSection
-EndSection
-Section "Monitor"
-  Identifier "Monitor0"
-  Option     "Ignore" "false"
 EndSection
 EOF
 
-###############################################################################
-# 5 · pre-download game(s) with SteamCMD
-###############################################################################
+### 6 · pre-download game(s) ##################################################
 install_dir="/home/gamer/SteamLibrary"
-sudo -u gamer mkdir -p "$install_dir"
-
+mkdir -p "$install_dir"
 if [[ -n "$STEAM_USER" && -n "$STEAM_PASS" ]]; then
-  log "Downloading games via SteamCMD (this can take a while)…"
+  log "Downloading games with SteamCMD (this may take a while)…"
   for id in "${APPIDS[@]}"; do
     sudo -u gamer steamcmd +@sSteamCmdForcePlatformType windows \
           +login "$STEAM_USER" "$STEAM_PASS" \
           +force_install_dir "$install_dir/$id" \
-          +app_update "$id" validate \
-          +quit
+          +app_update "$id" validate +quit
   done
 else
-  log "⚠️  No Steam credentials provided → skipping auto-download"
+  log "⚠️  STEAM_USER & STEAM_PASS not set – skipping auto-download"
 fi
 
-###############################################################################
-# 6 · one-shot runtime launcher
-###############################################################################
+### 7 · runtime launcher ######################################################
 cat >/usr/local/bin/start-steam-host <<"EOF"
 #!/usr/bin/env bash
 set -euo pipefail
 export DISPLAY=:0
 export HOME=/home/gamer
 
-# Xorg head-less + GPU
-if ! pgrep -fx "X .*:0"; then
+# start X once
+pgrep -fx "X .*:0" >/dev/null || \
   /usr/bin/X :0 -config /etc/X11/xorg.conf.d/10-headless.conf -nocursor \
-               &> /var/log/Xorg.0.log &
-fi
+               &>/var/log/Xorg.0.log &
 
-# PulseAudio (system mode is fine in container)
-pgrep -x pulseaudio || pulseaudio --system --disallow-exit --disable-shm &
+# PulseAudio (system mode)
+pgrep -x pulseaudio >/dev/null || \
+  pulseaudio --system --disallow-exit --disable-shm &
 
-# OPTIONAL VNC peek – uncomment for debugging then disable
-# pgrep -f "x11vnc.*5900" || \
-#   x11vnc -display :0 -forever -shared -nopw -rfbport 5900 &
-
-# Steam Big-Picture auto-login
-if [[ "${STEAM_AUTO}" == "yes" ]]; then
-  sudo -u gamer bash -c '
-    if ! pgrep -x steam; then
-      if [[ -n "$STEAM_USER" && -n "$STEAM_PASS" ]]; then
-        steam -silent -tenfoot -login "$STEAM_USER" "$STEAM_PASS" &
-      else
-        steam -silent -tenfoot &
-      fi
-    fi'
+# Steam Big-Picture
+if ! pgrep -x steam >/dev/null; then
+  if [[ -n "$STEAM_USER" && -n "$STEAM_PASS" ]]; then
+    sudo -u gamer steam -silent -tenfoot -login "$STEAM_USER" "$STEAM_PASS" &
+  else
+    sudo -u gamer steam -silent -tenfoot &
+  fi
 fi
 
 wait -n
 EOF
 chmod +x /usr/local/bin/start-steam-host
 
-###############################################################################
-# 7 · launch and finish
-###############################################################################
-log "Starting Steam-Link host…"
-/usr/local/bin/start-steam-host >/var/log/steam-host.log 2>&1 &
+### 8 · launch & done #########################################################
+log "Launching Steam host…"
+/usr/local/bin/start-steam-host > /var/log/steam-host.log 2>&1 &
 
-log "Setup complete."
-log "• Steam control port : 27036/tcp  (host side may be remapped)"
-log "• Steam data port    : 27037/udp  (host side may be remapped)"
-log "• Disk provisioned   : ensure --disk 130 when you create the instance"
+log "All set!  Open ports:"
+log " • TCP $(printenv VAST_TCP_PORT_27036:-27036)  (control)"
+log " • UDP $(printenv VAST_UDP_PORT_27037:-27037)  (video)"
+log "Add the computer manually in Steam Link with the *host-side* ports if auto-discover does not pick it up."
 exit 0
